@@ -15,7 +15,7 @@ class BaseVN(BaseEstimator):
         return None
 
     @abstractmethod
-    def predict(self, X):
+    def predict(self):
         return None
 
     @abstractmethod
