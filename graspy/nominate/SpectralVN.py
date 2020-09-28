@@ -69,25 +69,37 @@ class SpectralVN(BaseVN):
         self.distance_matrix = self._pairwise_dist(y)
         self._attr_labels = y[:, 1]
 
-    def predict(self):
+    def predict(self, out="best_preds"):
         if self.mode == 'single_vertex':
             ordered = self.distance_matrix.argsort(axis=1)
             sorted_dists = self.distance_matrix[np.arange(ordered.shape[0], ordered.T)].T
             return ordered, sorted_dists
-        elif self.mode == 'k-nearest':
+
+        elif self.mode == 'knn-weighted':
             ordered = self.distance_matrix.argsort(axis=1)
             sorted_dists = self.distance_matrix[np.arange(ordered.shape[0]), ordered.T].T
             atts = self._attr_labels[ordered[:, :5]]
-            att_preds, counts = mode(atts, axis=1)
-            tile = np.tile(att_preds, (1, atts.shape[1]))
-            inds = np.argwhere(atts == tile)
-            place_hold = np.empty(atts.shape)
-            place_hold[:] = np.NaN
-            place_hold[inds[:, 0], inds[:, 1]] = sorted_dists[inds[:, 0], inds[:, 1]]
-            pred_weights = np.nanmean(place_hold, axis=1)
-            vert_order = np.argsort(pred_weights, axis=0)
-            prediction = np.concatenate((vert_order.reshape(-1, 1), att_preds), axis=1)
-            return prediction, pred_weights[vert_order]
+            unique_att = np.unique(atts)
+            pred_weights = np.empty((atts.shape[0], unique_att.shape[0])) # use this array for bin counts as well to save space
+            for i in range(unique_att.shape[0]):
+                pred_weights[:, i] = np.count_nonzero(atts == unique_att[i], axis=1)
+                inds = np.argwhere(atts == unique_att[i])
+                place_hold = np.empty(atts.shape)
+                place_hold[:] = np.NaN
+                place_hold[inds[:, 0], inds[:, 1]] = sorted_dists[inds[:, 0], inds[:, 1]]
+                pred_weights[:, i] = np.nansum(place_hold, axis=1) / np.power(pred_weights[:, i], 2)
+
+            if out == 'best_preds':
+                best_pred_inds = np.nanargmin(pred_weights, axis=1)
+                best_pred_weights = pred_weights[np.arange(pred_weights.shape[0]), best_pred_inds]
+                vert_order = np.argsort(best_pred_weights, axis=0)
+                att_preds = unique_att[best_pred_inds[vert_order]]
+                prediction = np.concatenate((vert_order.reshape(-1, 1), att_preds.reshape(-1, 1)), axis=1)
+                return prediction, pred_weights[vert_order]
+            elif out == 'per_attribute':
+                pred_weights[np.argwhere(np.isnan(pred_weights))] = np.nanmax(pred_weights)
+                vert_orders = np.argsort(pred_weights, axis=0)
+                return vert_orders, pred_weights[vert_orders]
         else:
             raise KeyError("no such mode " + str(self.mode))
 
