@@ -18,8 +18,17 @@ class BaseSpectralVN(BaseVN):
                 self.embeder = ase()
             else:
                 raise TypeError
+        self.seed = None
         self._attr_labels = None
+        self.unique_att = None
         self.mode = mode
+
+    def _pairwise_dist(self, y: np.ndarray, metric='euclidian') -> np.ndarray:
+        # wrapper for scipy's cdist function
+        # y should give indexes
+        y_vec = self.embedding[y[:, 0]]
+        dist_mat = distance.cdist(self.embedding, y_vec, metric=metric)
+        return dist_mat
 
     def _embed(self, X: np.ndarray):
         # ensure X matches required dimensions for single and multigraph
@@ -35,7 +44,7 @@ class BaseSpectralVN(BaseVN):
         if self.embedding is None:
             self.embedding = self.embeder.fit_transform(X)
 
-    def fit(self, X: np.typing.ArrayLike, y: np.typing.ArrayLike):
+    def _fit(self, X: np.typing.ArrayLike, y: np.typing.ArrayLike):
         """
         Constructs the embedding if needed.
         Parameters
@@ -58,6 +67,12 @@ class BaseSpectralVN(BaseVN):
         else:
             y = y.reshape(-1, 2)
         self._attr_labels = y[:, 1]
+        self.seed = y[:, 0]
+        self.unique_att = np.unique(self._attr_labels)
+
+    @abstractmethod
+    def fit(self, X, y):
+        pass
 
     @abstractmethod
     def predict(self) -> np.ndarray:
@@ -81,15 +96,8 @@ class SpectralVertexNominator(BaseSpectralVN):
                              mode=mode)
         self.distance_matrix = None
 
-    def _pairwise_dist(self, y: np.ndarray, metric='euclidian') -> np.ndarray:
-        # wrapper for scipy's cdist function
-        # y should give indexes
-        y_vec = self.embedding[y[:, 0]]
-        dist_mat = distance.cdist(self.embedding, y_vec, metric=metric)
-        return dist_mat
-
     def fit(self, X, y):
-        super().fit(X, y)
+        self._fit(X, y)
         self.distance_matrix = self._pairwise_dist(y)
 
     def _knn_simple_predict(self):
@@ -123,12 +131,11 @@ class SpectralVertexNominator(BaseSpectralVN):
         ordered = self.distance_matrix.argsort(axis=1)
         sorted_dists = self.distance_matrix[np.arange(ordered.shape[0]), ordered.T].T
         atts = self._attr_labels[ordered[:, :k]]
-        unique_att = np.unique(atts)
         pred_weights = np.empty(
-            (atts.shape[0], unique_att.shape[0]))  # use this array for bin counts as well to save space
-        for i in range(unique_att.shape[0]):
-            pred_weights[:, i] = np.count_nonzero(atts == unique_att[i], axis=1)
-            inds = np.argwhere(atts == unique_att[i])
+            (atts.shape[0], self.unique_att.shape[0]))  # use this array for bin counts as well to save space
+        for i in range(self.unique_att.shape[0]):
+            pred_weights[:, i] = np.count_nonzero(atts == self.unique_att[i], axis=1)
+            inds = np.argwhere(atts == self.unique_att[i])
             place_hold = np.empty(atts.shape)
             place_hold[:] = np.NaN
             place_hold[inds[:, 0], inds[:, 1]] = sorted_dists[inds[:, 0], inds[:, 1]]
@@ -137,7 +144,7 @@ class SpectralVertexNominator(BaseSpectralVN):
             best_pred_inds = np.nanargmin(pred_weights, axis=1)
             best_pred_weights = pred_weights[np.arange(pred_weights.shape[0]), best_pred_inds]
             vert_order = np.argsort(best_pred_weights, axis=0)
-            att_preds = unique_att[best_pred_inds[vert_order]]
+            att_preds = self.unique_att[best_pred_inds[vert_order]]
             prediction = np.concatenate((vert_order.reshape(-1, 1), att_preds.reshape(-1, 1)), axis=1)
             return prediction, pred_weights[vert_order]
         elif out == 'per_attribute':
@@ -176,7 +183,58 @@ class SpectralVertexNominator(BaseSpectralVN):
         return self.predict()
 
 
-class SpectralClusteringVN(BaseVN):
-    def __init__(self):
-        super().__init__(multigraph=True)
-        pass
+class SpectralClusterVertexNominator(BaseSpectralVN):
+    def __init__(self, multigraph: bool = False,
+                 embedding: np.ndarray = None,
+                 embeder: Union[str, BaseEmbed] = 'ASE',
+                 mode: str = 'single_vertex'):
+        super(SpectralClusterVertexNominator,
+              self).__init__(multigraph=multigraph,
+                             embedding=embedding,
+                             embeder=embeder,
+                             mode=mode)
+        self.clf = None
+
+    def fit(self, X, y=None):
+        """
+        Unsupervised kmeans spectral nomination, as described
+        by Fishkind et. al. in Vertex Nomination for Membership Prediction.
+        Has the advantage of being able to identify attributes not represented
+        in seed population, however by default will select number of clusters
+        based on number of unique attributes in given seed.
+        Returns
+        -------
+
+        """
+        from sklearn.cluster import KMeans
+        self._fit(X, y)
+        self.clf = KMeans(n_clusters=self.unique_att.shape[0])
+        self.clf.fit(self.embedding)
+
+    def _cluster_map(self, y_hat):
+        map = {}
+        clusters = np.unique(y_hat)
+        for cluster in clusters:
+            att_ind = np.argwhere(y_hat == cluster).reshape(-1)
+            match = np.argwhere(self.seed == att_ind).reshape(-1)
+            if match.shape[0] != 0:
+                temp_labels = self._attr_labels.copy()
+                best_id = -1
+                while best_id in list(map.values()):
+                    best_id = mode(temp_labels[match], nan_policy='omit')
+                    temp_labels[np.argwhere(temp_labels == best_id)] = np.nan
+                map[cluster] = best_id
+        return map
+
+    def predict(self, out='best_pred'):
+        y_hat = self.clf.predict(self.embedding)
+        clust_to_att = self._cluster_map(y_hat)
+        clust_dists = self.clf.transform(self.embedding)
+        att_preds = np.empty(clust_dists.shape)
+        for i in range(clust_dists.shape[0]):
+            sort_inds = np.argsort(clust_dists[:, i])
+            att_preds[:, i] = sort_inds
+            clust_dists[:, i] = clust_dists
+        return att_preds, clust_dists
+
+
