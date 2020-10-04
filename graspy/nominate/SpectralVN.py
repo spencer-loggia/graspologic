@@ -226,7 +226,7 @@ class SpectralClusterVertexNominator(BaseSpectralVN):
                 map[cluster] = best_id
         return map
 
-    def predict(self, out='best_pred'):
+    def predict(self, out='per_attribute'):
         y_hat = self.clf.predict(self.embedding)
         clust_to_att = self._cluster_map(y_hat)
         clust_dists = self.clf.transform(self.embedding)
